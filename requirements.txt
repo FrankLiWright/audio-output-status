@@ -1,0 +1,4 @@
+pycaw>=20230407
+comtypes>=1.2.0
+numpy>=1.24
+psutil>=5.9.0
