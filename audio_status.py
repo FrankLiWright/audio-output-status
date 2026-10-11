@@ -221,8 +221,13 @@ class LoopbackCapture:
         pad = points - len(data)
         return [0.0] * pad + data
 
-    def spectrum_db(self, bands: int = 48, fft_size: int = 2048) -> list[float]:
-        """返回各频带的相对响度（dB，约 -72..0），按对数频率分组。"""
+    def spectrum_db(self, bands: int = 32, fft_size: int = 4096) -> list[float]:
+        """返回各频带 dBFS（约 -72..0），只反映真实 FFT 功率，不伪造峰值。
+
+        - 按对数频带累计 bin 功率
+        - 满量程正弦约 0 dBFS
+        - 某频带没有 bin 或无能量时如实显示地板，不向邻带插值“借”能量
+        """
         if np is None:
             return [-72.0] * bands
         with self._lock:
@@ -235,25 +240,28 @@ class LoopbackCapture:
         arr = np.asarray(data, dtype=np.float64)
         arr = arr - arr.mean()
         win = np.hanning(len(arr))
+        win_gain = float(win.sum())
         spec = np.fft.rfft(arr * win)
-        mag = np.abs(spec)
-        # 避免 log(0)
-        mag = np.maximum(mag, 1e-10)
-        # rfft 频率轴
+        # 归一化到 dBFS：满量程正弦 → 约 0 dB
+        mag = np.abs(spec) * 2.0 / max(win_gain, 1e-12)
         freqs = np.fft.rfftfreq(len(arr), d=1.0 / max(1, self.sample_rate))
 
-        # 对数频带 20Hz – 20kHz
-        f_min, f_max = 20.0, min(20000.0, self.sample_rate / 2.0)
+        f_min = 20.0
+        f_max = min(20000.0, self.sample_rate / 2.0)
         edges = np.logspace(np.log10(f_min), np.log10(f_max), bands + 1)
+
         out = [-72.0] * bands
+        # 跳过 DC bin（index 0）
         for i in range(bands):
             lo, hi = edges[i], edges[i + 1]
+            # bin 中心落在 [lo, hi) 的都算本带
             idx = np.where((freqs >= lo) & (freqs < hi))[0]
             if len(idx) == 0:
+                # 无 bin：如实为空（不借用邻带能量）
                 continue
-            # 频带能量 → dB
-            power = float(np.mean(mag[idx] ** 2))
-            db = 10.0 * np.log10(max(power, 1e-12)) - 20.0
+            # 功率和 → dBFS
+            power = float(np.sum(mag[idx] ** 2))
+            db = 10.0 * math.log10(max(power, 1e-16))
             out[i] = max(-72.0, min(0.0, db))
         return out
 
@@ -463,12 +471,10 @@ def render_text(snap: AudioSnapshot, peak: float = 0.0) -> str:
         f"输出设备  {snap.device_name}",
         "",
         "实际输出格式",
-        f"  编码    {f.get('format', '—')}",
-        f"  采样率  {f.get('sample_rate', 0):,} Hz",
         f"  位深    {f.get('bits_per_sample', 0)} bit",
-        f"  声道    {f.get('channel_layout', '—')}",
         f"  码率    {format_bitrate(int(f.get('bitrate_bps', 0)))}",
-        f"  帧字节  {f.get('block_align', 0)} B / {f.get('avg_bytes_per_sec', 0):,} B/s",
+        f"  声道    {f.get('channel_layout', '—')}",
+        f"  采样率  {f.get('sample_rate', 0):,} Hz",
         "",
         f"电平      {peak * 100:.0f}%",
         "",
@@ -590,13 +596,23 @@ def run_gui(refresh_ms: int = 16) -> None:
         body.pack(fill=tk.X, padx=8, pady=(0, 4))
         return body
 
+    def _field_label(parent: tk.Frame, text: str, indent: int = 0) -> None:
+        """标签定宽对齐；indent 为左缩进（英文字符数），用于微调个别标签位置。"""
+        display = (" " * indent) + text if indent else text
+        tk.Label(
+            parent,
+            text=display,
+            font=ui,
+            bg=CARD,
+            fg=DIM,
+            anchor="w",
+            width=8,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
     def add_field(parent: tk.Frame, label: str, value_font=None):
         row = tk.Frame(parent, bg=CARD)
         row.pack(fill=tk.X, pady=0)
-        tk.Label(
-            row, text=label, font=ui, bg=CARD, fg=DIM, anchor="w",
-            width=LAB_W,
-        ).pack(side=tk.LEFT)
+        _field_label(row, label)
         var = tk.StringVar(value="—")
         tk.Label(
             row,
@@ -609,17 +625,16 @@ def run_gui(refresh_ms: int = 16) -> None:
         return var
 
     def add_field_pair(parent: tk.Frame, left: tuple, right: tuple):
-        """一行两列，标签定宽对齐。"""
+        """一行两列，标签列等宽对齐。tuple: (label, value_font, indent?)"""
         row = tk.Frame(parent, bg=CARD)
         row.pack(fill=tk.X, pady=0)
         vars_out = []
-        for idx, (label, value_font) in enumerate((left, right)):
+        for item in (left, right):
+            label, value_font = item[0], item[1]
+            indent = item[2] if len(item) > 2 else 0
             cell = tk.Frame(row, bg=CARD)
             cell.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            tk.Label(
-                cell, text=label, font=ui, bg=CARD, fg=DIM, anchor="w",
-                width=LAB_W,
-            ).pack(side=tk.LEFT)
+            _field_label(cell, label, indent=indent)
             var = tk.StringVar(value="—")
             tk.Label(
                 cell,
@@ -637,15 +652,12 @@ def run_gui(refresh_ms: int = 16) -> None:
     v_device = add_field(card_dev, "设备", ui_bold)
 
     # ── 实际输出格式（双栏，标签定宽对齐）──────────────────
-    card_fmt = section("实际输出格式（实时）")
-    v_encoding, v_rate = add_field_pair(
-        card_fmt, ("编码", None), ("采样率", None)
-    )
+    card_fmt = section("实际输出格式")
     v_depth, v_channels = add_field_pair(
-        card_fmt, ("位深", None), ("声道", None)
+        card_fmt, ("位深", None), ("声道", None, 4)
     )
-    v_bitrate, v_bytes = add_field_pair(
-        card_fmt, ("码率", None), ("帧字节", ui_mono)
+    v_bitrate, v_rate = add_field_pair(
+        card_fmt, ("码率", None), ("采样率", None)
     )
 
     # ── 电平 / 频谱（声卡 LED + DAW 频谱）─────────────────
@@ -653,9 +665,7 @@ def run_gui(refresh_ms: int = 16) -> None:
 
     level_row = tk.Frame(card_wave, bg=CARD)
     level_row.pack(fill=tk.X, pady=(0, 1))
-    tk.Label(
-        level_row, text="电平", font=ui, bg=CARD, fg=DIM, width=LAB_W, anchor="w"
-    ).pack(side=tk.LEFT)
+    _field_label(level_row, "电平")
     led_canvas = tk.Canvas(
         level_row, height=18, bg="#111418", highlightthickness=1,
         highlightbackground=BORDER, bd=0,
@@ -722,7 +732,7 @@ def run_gui(refresh_ms: int = 16) -> None:
     smooth = {
         "led": 0.0,
         "peak": 0.0,
-        "spec": [-72.0] * 48,
+        "spec": [-72.0] * 32,
     }
 
     def _zone(ratio: float) -> str:
@@ -876,7 +886,8 @@ def run_gui(refresh_ms: int = 16) -> None:
         base_y = pad + usable_h
         for i in range(n):
             db = smooth["spec"][i]
-            t = max(0.0, min(1.0, (db + 72.0) / 72.0))
+            # 显示映射：-60 dBFS … 0 dBFS（0 dB = 满量程）
+            t = max(0.0, min(1.0, (db + 60.0) / 60.0))
             # 静音时也留一条底色
             bh = max(2.0, t * usable_h)
             x = pad + i * (bar_w + pad)
@@ -902,20 +913,16 @@ def run_gui(refresh_ms: int = 16) -> None:
         if live_fmt:
             snap.fmt = live_fmt
         f = snap.fmt or {}
-        status.set(f"实时 · {ts}  ·  {snap.device_name}")
+        status.set(f"实时 · {ts}")
         v_device.set(snap.device_name)
-        v_encoding.set(f.get("format", "—"))
-        v_rate.set(f"{f.get('sample_rate', 0):,} Hz")
         bits = f.get("bits_per_sample", 0)
         valid = f.get("valid_bits_per_sample", 0)
         v_depth.set(
-            f"{bits} bit" + (f"（有效 {valid} bit）" if valid and valid != bits else "")
+            f"{bits} bit" if not (valid and valid != bits) else f"{bits} bit（有效 {valid}）"
         )
         v_channels.set(f.get("channel_layout", "—"))
-        v_bitrate.set(format_bitrate(int(f.get("bitrate_bps", 0))) + "  （引擎输出·未压缩）")
-        v_bytes.set(
-            f"{f.get('block_align', 0)} B/帧  ·  {f.get('avg_bytes_per_sec', 0):,} B/s"
-        )
+        v_bitrate.set(format_bitrate(int(f.get("bitrate_bps", 0))))
+        v_rate.set(f"{f.get('sample_rate', 0):,} Hz")
 
         # 会话列表：显示全部，可滚动
         lines = []
@@ -966,7 +973,7 @@ def run_gui(refresh_ms: int = 16) -> None:
         try:
             peak = max(capture.peak, meter_peak())
             draw_led(peak)
-            draw_spectrum(capture.spectrum_db(48))
+            draw_spectrum(capture.spectrum_db(32))
 
             now = time.time()
             if now - last_snap >= snap_interval / 1000.0:
