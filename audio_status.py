@@ -198,6 +198,14 @@ class LoopbackCapture:
         self.sample_rate = 48000
         self.channels = 2
         self.fmt: dict = {}
+        self._win_cache: dict = {}
+
+    def _hann(self, n: int):
+        win = self._win_cache.get(n)
+        if win is None and np is not None:
+            win = np.hanning(n)
+            self._win_cache[n] = win
+        return win if win is not None else np.hanning(n)
 
     @property
     def peak(self) -> float:
@@ -221,12 +229,12 @@ class LoopbackCapture:
         pad = points - len(data)
         return [0.0] * pad + data
 
-    def spectrum_db(self, bands: int = 32, fft_size: int = 4096) -> list[float]:
-        """返回各频带 dBFS（约 -72..0），只反映真实 FFT 功率，不伪造峰值。
+    def spectrum_db(self, bands: int = 32, fft_size: int = 8192) -> list[float]:
+        """返回各频带 dBFS（约 -72..0）。
 
-        - 按对数频带累计 bin 功率
-        - 满量程正弦约 0 dBFS
-        - 某频带没有 bin 或无能量时如实显示地板，不向邻带插值“借”能量
+        每个对数频带取带内 FFT bin 的峰值：
+        - 纯音落在两中心点之间也不会被漏掉
+        - 带内无 bin 时用包络插值补洞（不抬高真实有能量的频带）
         """
         if np is None:
             return [-72.0] * bands
@@ -238,32 +246,36 @@ class LoopbackCapture:
             data = [0.0] * (fft_size - len(data)) + data
 
         arr = np.asarray(data, dtype=np.float64)
-        arr = arr - arr.mean()
-        win = np.hanning(len(arr))
-        win_gain = float(win.sum())
+        arr -= arr.mean()
+        n = len(arr)
+        win = self._hann(n)
         spec = np.fft.rfft(arr * win)
-        # 归一化到 dBFS：满量程正弦 → 约 0 dB
-        mag = np.abs(spec) * 2.0 / max(win_gain, 1e-12)
-        freqs = np.fft.rfftfreq(len(arr), d=1.0 / max(1, self.sample_rate))
+        mag = np.abs(spec) * (2.0 / max(float(win.sum()), 1e-12))
+        freqs = np.fft.rfftfreq(n, d=1.0 / max(1, self.sample_rate))
 
         f_min = 20.0
         f_max = min(20000.0, self.sample_rate / 2.0)
         edges = np.logspace(np.log10(f_min), np.log10(f_max), bands + 1)
+        centers = np.sqrt(edges[:-1] * edges[1:])
 
-        out = [-72.0] * bands
-        # 跳过 DC bin（index 0）
+        f = freqs[1:]
+        m = mag[1:]
+        db_bins = 20.0 * np.log10(np.maximum(m, 1e-10))
+        log_f = np.log10(np.maximum(f, 1e-3))
+
+        out = np.full(bands, -72.0)
         for i in range(bands):
             lo, hi = edges[i], edges[i + 1]
-            # bin 中心落在 [lo, hi) 的都算本带
-            idx = np.where((freqs >= lo) & (freqs < hi))[0]
-            if len(idx) == 0:
-                # 无 bin：如实为空（不借用邻带能量）
-                continue
-            # 功率和 → dBFS
-            power = float(np.sum(mag[idx] ** 2))
-            db = 10.0 * math.log10(max(power, 1e-16))
-            out[i] = max(-72.0, min(0.0, db))
-        return out
+            mask = (f >= lo) & (f < hi)
+            if np.any(mask):
+                # 带内峰值（纯音/共振峰不会被中心采样漏掉）
+                out[i] = float(np.max(db_bins[mask]))
+            else:
+                # 该对数带窄于 bin 宽度：用包络插值补洞
+                out[i] = float(np.interp(math.log10(centers[i]), log_f, db_bins))
+
+        np.clip(out, -72.0, 0.0, out=out)
+        return out.tolist()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -516,8 +528,18 @@ def _enable_dpi() -> None:
         pass
 
 
+def _enable_hires_timer() -> None:
+    """把 Windows 定时器精度提到 1ms，否则 after() 约 15ms 才醒，上不了 120Hz。"""
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+
 def run_gui(refresh_ms: int = 16) -> None:
     _enable_dpi()
+    _enable_hires_timer()
     import tkinter as tk
     from tkinter import ttk
     from tkinter import font as tkfont
@@ -654,7 +676,7 @@ def run_gui(refresh_ms: int = 16) -> None:
     # ── 实际输出格式（双栏，标签定宽对齐）──────────────────
     card_fmt = section("实际输出格式")
     v_depth, v_channels = add_field_pair(
-        card_fmt, ("位深", None), ("声道", None, 4)
+        card_fmt, ("位深", None), ("声道", None, 5)
     )
     v_bitrate, v_rate = add_field_pair(
         card_fmt, ("码率", None), ("采样率", None)
@@ -678,7 +700,7 @@ def run_gui(refresh_ms: int = 16) -> None:
 
     spec_canvas = tk.Canvas(
         card_wave,
-        height=92,
+        height=130,
         bg="#1a1d21",
         highlightthickness=1,
         highlightbackground=BORDER,
@@ -746,15 +768,15 @@ def run_gui(refresh_ms: int = 16) -> None:
         """声卡式绿/黄/红分段 LED 电平条（attack 快 / release 慢）。"""
         w = led_canvas.winfo_width() or 300
         h = led_canvas.winfo_height() or 18
-        segs = 40
+        segs = 28
         gap = 1
         seg_w = max(3, (w - gap * (segs - 1)) // segs)
 
         # 平滑：快上慢下
         if level > smooth["led"]:
-            smooth["led"] = smooth["led"] * 0.35 + level * 0.65
+            smooth["led"] = smooth["led"] * 0.4 + level * 0.6
         else:
-            smooth["led"] = smooth["led"] * 0.88 + level * 0.12
+            smooth["led"] = smooth["led"] * 0.9 + level * 0.1
         lvl = max(level, smooth["led"])
 
         if lvl <= 0.00001:
@@ -778,29 +800,44 @@ def run_gui(refresh_ms: int = 16) -> None:
         if led_items.get("key") != key:
             led_canvas.delete("all")
             led_items["rects"] = []
+            led_items["colors"] = []
             for i in range(segs):
                 x = i * (seg_w + gap)
                 r = led_canvas.create_rectangle(
                     x, 2, x + seg_w, h - 2, width=0, fill=LED_OFF_G
                 )
                 led_items["rects"].append(r)
+                led_items["colors"].append(LED_OFF_G)
             led_items["peak"] = led_canvas.create_rectangle(
                 0, 1, 2, h - 1, width=0, fill="#f8fafc"
             )
             led_items["key"] = key
             led_items["built"] = True
 
-        for i, rid in enumerate(led_items["rects"]):
-            ratio = (i + 1) / segs
-            zone = _zone(ratio)
-            on = i < lit
-            if zone == "R":
-                color = LED_ON_R if on else LED_OFF_R
-            elif zone == "Y":
-                color = LED_ON_Y if on else LED_OFF_Y
+        # 只在颜色变化时 itemconfig，降低每帧开销
+        colors = led_items["colors"]
+        rects = led_items["rects"]
+        zone_t = segs
+        y_off = (segs * 72) // 100  # 72%
+        r_off = (segs * 92) // 100
+        for i in range(segs):
+            if i < lit:
+                if i >= r_off:
+                    color = LED_ON_R
+                elif i >= y_off:
+                    color = LED_ON_Y
+                else:
+                    color = LED_ON_G
             else:
-                color = LED_ON_G if on else LED_OFF_G
-            led_canvas.itemconfig(rid, fill=color)
+                if i >= r_off:
+                    color = LED_OFF_R
+                elif i >= y_off:
+                    color = LED_OFF_Y
+                else:
+                    color = LED_OFF_G
+            if colors[i] != color:
+                colors[i] = color
+                led_canvas.itemconfig(rects[i], fill=color)
 
         px = max(0, min(segs - 1, ph_idx - 1)) * (seg_w + gap)
         led_canvas.coords(led_items["peak"], px, 1, px + 2, h - 1)
@@ -811,26 +848,32 @@ def run_gui(refresh_ms: int = 16) -> None:
             v_level.set(f"{db:.1f} dB")
 
     def draw_spectrum(bands_db: list[float]) -> None:
-        """DAW 风格频谱：对数频率 × 响度条，频率轴按 log 刻度标注。"""
-        w = spec_canvas.winfo_width() or 400
-        h = spec_canvas.winfo_height() or 92
-        n = len(bands_db) or 48
+        """DAW 风格频谱：对数频率 × 响度柱。"""
+        w = spec_canvas.winfo_width() or 460
+        h = spec_canvas.winfo_height() or 130
+        n = len(bands_db) or 32
         pad = 2
+        axis_w = 34  # 左侧响度刻度留白，避免被第一根频带遮挡
         label_h = 14
-        usable_h = h - pad * 2 - label_h
-        bar_w = max(2, (w - pad * (n + 1)) // n)
+        usable_h = max(20, h - pad * 2 - label_h)
+        base_y = pad + usable_h
+        plot_x0 = pad + axis_w
+        plot_w = max(40, w - plot_x0 - pad)
+        step = plot_w / max(1, n)
+        bar_w = max(2.0, step - 1.0)
 
-        # 频谱平滑：快上慢下
-        if len(smooth["spec"]) != n:
-            smooth["spec"] = [-72.0] * n
-        for i, db in enumerate(bands_db):
-            prev = smooth["spec"][i]
+        sp = smooth["spec"]
+        if len(sp) != n:
+            sp = smooth["spec"] = [-72.0] * n
+        for i in range(n):
+            db = bands_db[i]
+            prev = sp[i]
             if db > prev:
-                smooth["spec"][i] = prev * 0.35 + db * 0.65
+                sp[i] = prev * 0.4 + db * 0.6
             else:
-                smooth["spec"][i] = prev * 0.88 + db * 0.12
+                sp[i] = prev * 0.9 + db * 0.1
 
-        key = (n, w, h, bar_w)
+        key = (n, int(w), int(h), int(bar_w))
         if spec_items.get("key") != key:
             spec_canvas.delete("all")
             fmin, fmax = 20.0, 20000.0
@@ -838,70 +881,64 @@ def run_gui(refresh_ms: int = 16) -> None:
 
             def freq_to_x(f: float) -> float:
                 t = (math.log10(f) - math.log10(fmin)) / log_span
-                return pad + t * (w - 2 * pad)
+                return plot_x0 + t * plot_w
 
-            # dB 横线
-            for frac, label in ((0.25, "-18"), (0.5, "-36"), (0.75, "-54")):
+            for frac, label in (
+                (0.1667, "-10"), (0.3333, "-20"), (0.5, "-30"),
+                (0.6667, "-40"), (0.8333, "-50"),
+            ):
                 y = int(pad + usable_h * frac)
-                spec_canvas.create_line(0, y, w, y, fill="#2f3540", tags="grid")
+                spec_canvas.create_line(plot_x0, y, w - pad, y, fill="#2f3540", tags="grid")
                 spec_canvas.create_text(
-                    4, y, text=label, anchor="w", fill="#666c75",
-                    font=tkfont.Font(family="Segoe UI", size=6), tags="grid",
+                    axis_w - 4, y, text=label, anchor="e", fill="#666c75",
+                    font=("Segoe UI", 6), tags="grid",
                 )
-
-            # 对数频率刻度线 + 标签
             marks = (
                 (20, "20"), (50, "50"), (100, "100"), (200, "200"),
                 (500, "500"), (1000, "1k"), (2000, "2k"), (5000, "5k"),
                 (10000, "10k"), (20000, "20k"),
             )
-            lab_font = tkfont.Font(family="Segoe UI", size=6)
             for f, lab in marks:
                 x = freq_to_x(f)
-                spec_canvas.create_line(
-                    x, pad, x, pad + usable_h, fill="#2a3140", tags="grid"
-                )
-                anchor = "w" if f <= 20 else ("e" if f >= 20000 else "center")
-                if f == 20:
-                    anchor = "w"
-                if f == 20000:
-                    anchor = "e"
+                spec_canvas.create_line(x, pad, x, base_y, fill="#2a3140", tags="grid")
+                anchor = "w" if f == 20 else ("e" if f == 20000 else "center")
                 spec_canvas.create_text(
                     x, h - label_h / 2 - 1, text=lab, anchor=anchor,
-                    fill="#8b919a", font=lab_font, tags="grid",
+                    fill="#8b919a", font=("Segoe UI", 6), tags="grid",
                 )
-
+            # 每条频带一个矩形（可靠、可单独改高度）
             spec_items["bars"] = []
+            spec_items["colors"] = []
             for i in range(n):
-                x = pad + i * (bar_w + pad)
+                x = plot_x0 + i * step
                 r = spec_canvas.create_rectangle(
-                    x, pad + usable_h, x + bar_w, pad + usable_h,
-                    width=0, fill=SPEC_FILL
+                    x, base_y - 1, x + bar_w, base_y,
+                    width=0, fill=SPEC_FILL,
                 )
                 spec_items["bars"].append(r)
+                spec_items["colors"].append(SPEC_FILL)
             spec_items["key"] = key
             spec_items["built"] = True
             spec_items["n"] = n
 
-        base_y = pad + usable_h
+        bars = spec_items["bars"]
+        colors = spec_items["colors"]
         for i in range(n):
-            db = smooth["spec"][i]
-            # 显示映射：-60 dBFS … 0 dBFS（0 dB = 满量程）
-            t = max(0.0, min(1.0, (db + 60.0) / 60.0))
-            # 静音时也留一条底色
-            bh = max(2.0, t * usable_h)
-            x = pad + i * (bar_w + pad)
+            db = sp[i]
+            t = 0.0 if db <= -60.0 else min(1.0, (db + 60.0) / 60.0)
+            bh = 1.5 if t <= 0.0 else t * usable_h
+            x = plot_x0 + i * step
             y0 = base_y - bh
-            y1 = base_y
+            spec_canvas.coords(bars[i], x, y0, x + bar_w, base_y)
             if t > 0.75:
                 color = SPEC_TOP
             elif t > 0.08:
                 color = SPEC_FILL
             else:
                 color = SPEC_DIM
-            rid = spec_items["bars"][i]
-            spec_canvas.coords(rid, x, y0, x + bar_w, y1)
-            spec_canvas.itemconfig(rid, fill=color)
+            if colors[i] != color:
+                colors[i] = color
+                spec_canvas.itemconfig(bars[i], fill=color)
 
     def apply_snapshot(snap: AudioSnapshot) -> None:
         ts = time.strftime("%H:%M:%S", time.localtime(snap.timestamp))
@@ -962,10 +999,10 @@ def run_gui(refresh_ms: int = 16) -> None:
             meter_ref["obj"] = None
             return 0.0
 
-    # 快路径：电平 + 波形（约 30–60 FPS）
+    # 快路径：电平 + 频谱（目标 ≥120 FPS）
     # 慢路径：完整设备/格式/会话快照
-    wave_interval = 12
-    snap_interval = 250  # 格式/会话也较频繁刷新，贴近“实时”
+    wave_interval = 7
+    snap_interval = 250  # 格式/会话较频繁刷新，贴近“实时”
     last_snap = 0.0
 
     def tick_fast() -> None:
@@ -994,7 +1031,7 @@ def run_gui(refresh_ms: int = 16) -> None:
 
     def fit_window() -> None:
         """宽度固定 560，高度按内容刚好容纳。"""
-        root.geometry("560x900")
+        root.geometry("620x900")
         root.update_idletasks()
         root.update()
         # 先填充一次真实内容（会话/格式），再量高度
@@ -1011,9 +1048,9 @@ def run_gui(refresh_ms: int = 16) -> None:
         for child in main.winfo_children():
             content_bottom = max(content_bottom, _abs_bottom(child, my))
         req_h = content_bottom + deco + 10
-        root.geometry(f"560x{req_h}")
-        root.minsize(560, req_h)
-        root.maxsize(560, req_h)
+        root.geometry(f"620x{req_h}")
+        root.minsize(620, req_h)
+        root.maxsize(620, req_h)
 
     fit_window()
 
